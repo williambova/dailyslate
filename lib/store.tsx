@@ -5,33 +5,32 @@ import React, {
   useCallback,
   useContext,
   useEffect,
-  useMemo,
   useState,
 } from "react";
 import type { Game, Pick } from "@/types";
-import { getTodaySlate, SLATE_DATE } from "@/data/mockGames";
-import { seededPicks } from "@/data/mockPicks";
-import { CURRENT_USER } from "@/data/mockUsers";
 import { pickTypeFor } from "@/lib/scoring";
+import { useAuth } from "@/lib/auth";
+import { supabase } from "@/lib/supabase";
 
 /**
- * Single source of truth for the live session: the slate, the current user's
- * picks, and the lock state.
- *
- * Data source: on mount we fetch /api/slate (real ESPN games for today). If
- * that returns games, we use them ("live"). If it's empty or unreachable we
- * fall back to the bundled mock slate ("mock") so the app always renders.
- * In production this becomes a thin layer over Supabase (realtime on `games`,
- * optimistic writes to `picks`).
+ * Slate state: today's REAL games (ESPN via /api/slate) + the user's picks.
+ * Identity comes from useAuth(). Picks persist to Supabase when signed in,
+ * otherwise to localStorage (guest). Cloud writes are best-effort: the local
+ * state is always the in-session source of truth, so a write hiccup never
+ * blocks picking.
  */
 
-export type SlateSource = "live" | "mock" | "loading";
+export type SlateSource = "loading" | "live" | "empty" | "error";
+
+const PICKS_KEY = "dailyslate:picks";
 
 interface SlateState {
-  user: typeof CURRENT_USER;
+  user: ReturnType<typeof useAuth>["user"];
+  isGuest: boolean;
+  setDisplayName: (name: string) => void;
   date: Date;
   games: Game[];
-  picks: Record<string, Pick>; // keyed by gameId
+  picks: Record<string, Pick>;
   cardLocked: boolean;
   source: SlateSource;
   loading: boolean;
@@ -39,56 +38,135 @@ interface SlateState {
   clearPick: (gameId: string) => void;
   lockPicks: () => void;
   isEditable: (game: Game) => boolean;
+  reload: () => void;
+  slateKey: string;
 }
 
 const Ctx = createContext<SlateState | null>(null);
 
-function seedMap(): Record<string, Pick> {
-  return Object.fromEntries(seededPicks.map((p) => [p.gameId, p]));
-}
-
 export function SlateProvider({ children }: { children: React.ReactNode }) {
+  const { user, isAuthed, authUserId, status, setGuestName } = useAuth();
+
   const [games, setGames] = useState<Game[]>([]);
-  const [date, setDate] = useState<Date>(SLATE_DATE);
+  const [date, setDate] = useState<Date>(() => new Date());
   const [picks, setPicks] = useState<Record<string, Pick>>({});
   const [cardLocked, setCardLocked] = useState(false);
   const [source, setSource] = useState<SlateSource>("loading");
+  const [slateKey, setSlateKey] = useState<string>("");
 
-  // Load today's real slate; fall back to mock.
+  // 1) Fetch today's real slate (games only — picks load separately).
+  const load = useCallback(async () => {
+    setSource("loading");
+    try {
+      const res = await fetch("/api/slate", { cache: "no-store" });
+      if (!res.ok) {
+        setSource("error");
+        return;
+      }
+      const data = await res.json();
+      const list: Game[] = Array.isArray(data.games) ? data.games : [];
+      const d = data.date ? new Date(data.date) : new Date();
+      const key = (data.date as string) ?? d.toISOString().slice(0, 10);
+      setGames(list);
+      setDate(d);
+      setSlateKey(key);
+      setSource(list.length > 0 ? "live" : "empty");
+    } catch {
+      setSource("error");
+    }
+  }, []);
+
   useEffect(() => {
-    let cancelled = false;
+    load();
+  }, [load]);
 
-    const useMock = () => {
-      if (cancelled) return;
-      setGames(getTodaySlate());
-      setDate(SLATE_DATE);
-      setPicks(seedMap()); // seeded picks demo live/final card states
-      setSource("mock");
-    };
+  // 2) Load this slate's picks once we know the slate + auth state.
+  useEffect(() => {
+    if (!slateKey || status === "loading") return;
+    let active = true;
 
-    (async () => {
+    const fromLocal = () => {
       try {
-        const res = await fetch("/api/slate", { cache: "no-store" });
-        if (!res.ok) throw new Error("bad status");
-        const data = await res.json();
-        if (cancelled) return;
-        if (Array.isArray(data.games) && data.games.length > 0) {
-          setGames(data.games);
-          setDate(data.date ? new Date(data.date) : new Date());
-          setPicks({}); // real games carry their own live/final states
-          setSource("live");
-        } else {
-          useMock();
+        const raw = localStorage.getItem(`${PICKS_KEY}:${slateKey}`);
+        if (raw) {
+          const saved = JSON.parse(raw) as {
+            picks: Record<string, Pick>;
+            cardLocked: boolean;
+          };
+          const valid: Record<string, Pick> = {};
+          for (const g of games) if (saved.picks?.[g.id]) valid[g.id] = saved.picks[g.id];
+          if (active) {
+            setPicks(valid);
+            setCardLocked(!!saved.cardLocked);
+          }
+          return;
         }
       } catch {
-        useMock();
+        /* ignore */
       }
-    })();
+      if (active) {
+        setPicks({});
+        setCardLocked(false);
+      }
+    };
+
+    const fromCloud = async () => {
+      if (!supabase || !authUserId) return fromLocal();
+      try {
+        const { data, error } = await supabase
+          .from("picks")
+          .select("game_id, selected_team, pick_type, is_locked, created_at")
+          .eq("user_id", authUserId)
+          .eq("slate_date", slateKey);
+        if (error) throw error;
+        const map: Record<string, Pick> = {};
+        let locked = false;
+        for (const r of data ?? []) {
+          map[r.game_id] = {
+            id: `p_${r.game_id}`,
+            userId: authUserId,
+            gameId: r.game_id,
+            selectedTeam: r.selected_team,
+            isLocked: r.is_locked,
+            isCorrect: null,
+            pickType: r.pick_type,
+            createdAt: r.created_at ?? new Date().toISOString(),
+          };
+          if (r.is_locked) locked = true;
+        }
+        if (active) {
+          setPicks(map);
+          setCardLocked(locked);
+        }
+      } catch {
+        // Fall back to whatever is cached locally if the read fails.
+        fromLocal();
+      }
+    };
+
+    if (isAuthed) fromCloud();
+    else fromLocal();
 
     return () => {
-      cancelled = true;
+      active = false;
     };
-  }, []);
+  }, [slateKey, status, isAuthed, authUserId, games]);
+
+  // Persist helpers.
+  const persistLocal = useCallback(
+    (nextPicks: Record<string, Pick>, locked: boolean) => {
+      if (!slateKey) return;
+      try {
+        localStorage.setItem(
+          `${PICKS_KEY}:${slateKey}`,
+          JSON.stringify({ picks: nextPicks, cardLocked: locked })
+        );
+      } catch {
+        /* ignore */
+      }
+    },
+    [slateKey]
+  );
 
   const isEditable = useCallback(
     (game: Game) => game.status === "open" && !picks[game.id]?.isLocked,
@@ -99,44 +177,88 @@ export function SlateProvider({ children }: { children: React.ReactNode }) {
     (gameId: string, team: string) => {
       const game = games.find((g) => g.id === gameId);
       if (!game || game.status !== "open") return;
-      setPicks((prev) => {
-        if (prev[gameId]?.isLocked) return prev;
-        const next: Pick = {
-          id: prev[gameId]?.id ?? `p_${gameId}_${Date.now()}`,
-          userId: CURRENT_USER.id,
-          gameId,
-          selectedTeam: team,
-          isLocked: false,
-          isCorrect: null,
-          pickType: pickTypeFor(team, game),
-          createdAt: new Date().toISOString(),
-        };
-        return { ...prev, [gameId]: next };
-      });
+      if (picks[gameId]?.isLocked) return;
+
+      const next: Pick = {
+        id: picks[gameId]?.id ?? `p_${gameId}_${Date.now()}`,
+        userId: user.id,
+        gameId,
+        selectedTeam: team,
+        isLocked: false,
+        isCorrect: null,
+        pickType: pickTypeFor(team, game),
+        createdAt: new Date().toISOString(),
+      };
+      const nextPicks = { ...picks, [gameId]: next };
+      setPicks(nextPicks);
+
+      if (isAuthed && supabase && authUserId) {
+        supabase
+          .from("picks")
+          .upsert(
+            {
+              user_id: authUserId,
+              slate_date: slateKey,
+              game_id: gameId,
+              league: game.league,
+              selected_team: team,
+              pick_type: next.pickType,
+              is_locked: false,
+            },
+            { onConflict: "user_id,slate_date,game_id" }
+          )
+          .then(({ error }) => error && console.error("pick save failed", error.message));
+      } else {
+        persistLocal(nextPicks, cardLocked);
+      }
     },
-    [games]
+    [games, picks, user.id, isAuthed, authUserId, slateKey, cardLocked, persistLocal]
   );
 
-  const clearPick = useCallback((gameId: string) => {
-    setPicks((prev) => {
-      if (prev[gameId]?.isLocked) return prev;
-      const next = { ...prev };
-      delete next[gameId];
-      return next;
-    });
-  }, []);
+  const clearPick = useCallback(
+    (gameId: string) => {
+      if (picks[gameId]?.isLocked) return;
+      const nextPicks = { ...picks };
+      delete nextPicks[gameId];
+      setPicks(nextPicks);
+
+      if (isAuthed && supabase && authUserId) {
+        supabase
+          .from("picks")
+          .delete()
+          .eq("user_id", authUserId)
+          .eq("slate_date", slateKey)
+          .eq("game_id", gameId)
+          .then(({ error }) => error && console.error("pick delete failed", error.message));
+      } else {
+        persistLocal(nextPicks, cardLocked);
+      }
+    },
+    [picks, isAuthed, authUserId, slateKey, cardLocked, persistLocal]
+  );
 
   const lockPicks = useCallback(() => {
-    setPicks((prev) => {
-      const next: Record<string, Pick> = {};
-      for (const [gid, p] of Object.entries(prev)) next[gid] = { ...p, isLocked: true };
-      return next;
-    });
+    const nextPicks: Record<string, Pick> = {};
+    for (const [gid, p] of Object.entries(picks)) nextPicks[gid] = { ...p, isLocked: true };
+    setPicks(nextPicks);
     setCardLocked(true);
-  }, []);
+
+    if (isAuthed && supabase && authUserId) {
+      supabase
+        .from("picks")
+        .update({ is_locked: true })
+        .eq("user_id", authUserId)
+        .eq("slate_date", slateKey)
+        .then(({ error }) => error && console.error("lock failed", error.message));
+    } else {
+      persistLocal(nextPicks, true);
+    }
+  }, [picks, isAuthed, authUserId, slateKey, persistLocal]);
 
   const value: SlateState = {
-    user: CURRENT_USER,
+    user,
+    isGuest: !isAuthed,
+    setDisplayName: setGuestName,
     date,
     games,
     picks,
@@ -147,6 +269,8 @@ export function SlateProvider({ children }: { children: React.ReactNode }) {
     clearPick,
     lockPicks,
     isEditable,
+    reload: load,
+    slateKey,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
@@ -158,7 +282,6 @@ export function useSlate(): SlateState {
   return ctx;
 }
 
-/** Derived helpers used across screens. */
 export function useSlateDerived() {
   const { games, picks } = useSlate();
   const picksList = Object.values(picks);
