@@ -1,10 +1,27 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Sparkles, Target, TrendingUp } from "lucide-react";
 import type { User } from "@/types";
 import { useSlate, useSlateDerived } from "@/lib/store";
+import { useAuth } from "@/lib/auth";
+import {
+  dailyRecords,
+  ensureGraded,
+  fetchPicksRange,
+  fetchResultsRange,
+  recentSlateKeys,
+} from "@/lib/history";
 import { computeDailyRecord, deriveBadges, countByType } from "@/lib/scoring";
 import { Badge } from "./Badge";
+import { cn } from "@/lib/cn";
+
+interface DayRec {
+  slateDate: string;
+  correct: number;
+  completed: number;
+  locked: number;
+}
 
 /**
  * Profile + stats. Everything here is derived from the user's REAL activity.
@@ -13,13 +30,51 @@ import { Badge } from "./Badge";
  * accrue once accounts persist results (Supabase).
  */
 export function ProfileStats({ user }: { user: User }) {
-  const { games } = useSlate();
+  const { games, slateKey } = useSlate();
   const { picksList } = useSlateDerived();
+  const { isAuthed, authUserId } = useAuth();
 
   const record = computeDailyRecord(picksList, games);
   const badges = deriveBadges(record, picksList, games, user.currentStreak);
   const { favorites, underdogs } = countByType(picksList);
   const hasPicks = picksList.length > 0;
+
+  // Real 7-day history (authed only; grades against stored results).
+  const [history, setHistory] = useState<DayRec[]>([]);
+  useEffect(() => {
+    if (!isAuthed || !authUserId || !slateKey) return;
+    let active = true;
+    (async () => {
+      try {
+        const dates = recentSlateKeys(7);
+        let [picks, results] = await Promise.all([
+          fetchPicksRange([authUserId], dates),
+          fetchResultsRange(dates),
+        ]);
+        if (await ensureGraded(picks, results, slateKey)) {
+          results = await fetchResultsRange(dates);
+        }
+        if (active) setHistory(dailyRecords(picks, results, slateKey, games));
+      } catch {
+        /* leave empty */
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [isAuthed, authUserId, slateKey, games]);
+
+  const totals = history.reduce(
+    (acc, d) => ({
+      correct: acc.correct + d.correct,
+      completed: acc.completed + d.completed,
+    }),
+    { correct: 0, completed: 0 }
+  );
+  const weekPct =
+    totals.completed > 0
+      ? Math.round((totals.correct / totals.completed) * 100)
+      : null;
 
   return (
     <div className="space-y-5">
@@ -34,7 +89,63 @@ export function ProfileStats({ user }: { user: User }) {
           </h1>
           <p className="text-sm font-medium text-ink-600">@{user.username}</p>
         </div>
+        {weekPct !== null && (
+          <div className="text-right">
+            <div className="tnum text-3xl font-extrabold leading-none text-lime">
+              {weekPct}
+              <span className="text-base text-ink-600">%</span>
+            </div>
+            <div className="text-[10px] font-bold uppercase tracking-wide text-ink-600">
+              7-day win
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Last 7 days (real, graded) */}
+      {history.length > 0 && (
+        <div>
+          <SectionLabel>Last 7 days</SectionLabel>
+          <div className="space-y-1.5">
+            {history.map((d) => {
+              const pct =
+                d.completed > 0
+                  ? Math.round((d.correct / d.completed) * 100)
+                  : null;
+              const label = new Date(d.slateDate).toLocaleDateString("en-US", {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+              });
+              return (
+                <div
+                  key={d.slateDate}
+                  className="flex items-center justify-between rounded-xl border border-line bg-ink-850/60 px-3.5 py-2.5 text-sm"
+                >
+                  <span className="font-semibold text-ink-600">{label}</span>
+                  <span className="tnum font-bold">
+                    {d.completed > 0 ? (
+                      <>
+                        {d.correct}/{d.completed}
+                        <span
+                          className={cn(
+                            "ml-2",
+                            pct !== null && pct >= 50 ? "text-lime" : "text-ink-600"
+                          )}
+                        >
+                          {pct}%
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-ink-600">{d.locked} locked · pending</span>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Today's card — only if the user has actually picked */}
       {hasPicks ? (
@@ -79,7 +190,7 @@ export function ProfileStats({ user }: { user: User }) {
             </div>
           </div>
         </>
-      ) : (
+      ) : history.length === 0 ? (
         <div className="rounded-3xl border border-dashed border-line bg-ink-850/40 p-10 text-center">
           <TrendingUp className="mx-auto h-8 w-8 text-ink-600" />
           <p className="mt-3 text-sm font-semibold">No history yet.</p>
@@ -88,7 +199,7 @@ export function ProfileStats({ user }: { user: User }) {
             will start building here.
           </p>
         </div>
-      )}
+      ) : null}
 
       {/* What unlocks with an account */}
       <div className="rounded-2xl border border-line bg-ink-850/60 p-4">
