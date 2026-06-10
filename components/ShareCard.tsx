@@ -400,7 +400,7 @@ export const ShareCard = forwardRef<HTMLDivElement, ShareCardProps>(
             Daily<span style={{ color: "#C6F24E" }}>Slate</span>
           </span>
           <span style={{ fontSize: 24, fontWeight: 600, color: "#9AA0AB" }}>
-            Pick winners. Beat your friends.
+            dailyslate.io
           </span>
         </div>
       </div>
