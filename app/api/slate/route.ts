@@ -1,88 +1,55 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-import type { League } from "@/types";
-import {
-  fetchLeague,
-  easternYyyymmdd,
-  easternYyyymmddDaysAgo,
-  slateKeyFromYyyymmdd,
-  ESPN_ENDPOINTS,
-} from "@/lib/espn";
+import type { Game, League } from "@/types";
+import { fetchLeague, easternYyyymmdd, ESPN_ENDPOINTS } from "@/lib/espn";
+import { sportMeta } from "@/lib/sportConfig";
 
 /**
- * GET /api/grade?date=YYYYMMDD   (no date → grades YESTERDAY, Eastern)
+ * GET /api/slate?date=YYYYMMDD
  *
- * Pulls that day's scoreboard from ESPN, keeps only FINAL games with a
- * winner, and upserts them into public.results using the service-role key
- * (server-only, bypasses RLS — clients can never write results).
+ * Server-side aggregation of today's real games from ESPN across the leagues
+ * we support, normalized into Game[] and ordered by sport. Runs on the server
+ * (no CORS, ESPN never exposed to the client). The client store calls this and
+ * falls back to mock data if it returns empty/unreachable.
  *
- * Idempotent and safe to call repeatedly: re-grading a day just overwrites
- * the same rows. Triggered two ways:
- *   1. Vercel Cron daily (see vercel.json) for yesterday.
- *   2. Lazily from the leaderboard/profile when a past day with picks has
- *      no results yet (covers cron-misses and backfills history).
+ * Per-league caps keep busy days (college) from flooding the slate; tune
+ * MAX_PER_LEAGUE per product taste, or curate to "featured" games later.
  */
 
-export const revalidate = 0;
+export const revalidate = 60;
 
-const LEAGUES = Object.keys(ESPN_ENDPOINTS) as League[];
+// Which leagues to include, in slate order. Trim to taste (e.g. US majors only).
+const LEAGUES: League[] = (Object.keys(ESPN_ENDPOINTS) as League[]).sort(
+  (a, b) => sportMeta(a).order - sportMeta(b).order
+);
+
+const MAX_PER_LEAGUE: Partial<Record<League, number>> = {
+  NCAAF: 8,
+  NCAAB: 8,
+  CBB: 6,
+};
+const DEFAULT_CAP = 12;
 
 export async function GET(request: Request) {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !serviceKey) {
-    return NextResponse.json(
-      { error: "Grading not configured: missing SUPABASE_SERVICE_ROLE_KEY." },
-      { status: 501 }
-    );
-  }
-
   const { searchParams } = new URL(request.url);
   const dateParam = searchParams.get("date");
   const yyyymmdd =
-    dateParam && /^\d{8}$/.test(dateParam)
-      ? dateParam
-      : easternYyyymmddDaysAgo(1);
+    dateParam && /^\d{8}$/.test(dateParam) ? dateParam : easternYyyymmdd();
 
-  // Refuse future dates (nothing to grade).
-  if (yyyymmdd > easternYyyymmdd()) {
-    return NextResponse.json({ date: yyyymmdd, graded: 0, note: "future date" });
-  }
-
-  const slateDate = slateKeyFromYyyymmdd(yyyymmdd);
-
-  const perLeague = await Promise.all(
-    LEAGUES.map((lg) => fetchLeague(lg, yyyymmdd, 50))
+  const results = await Promise.all(
+    LEAGUES.map((lg) => fetchLeague(lg, yyyymmdd, MAX_PER_LEAGUE[lg] ?? DEFAULT_CAP))
   );
 
-  const rows = perLeague
-    .flat()
-    .filter((g) => g.status === "final" && g.winner)
-    .map((g) => ({
-      slate_date: slateDate,
-      game_id: g.id,
-      league: g.league,
-      winner: g.winner as string,
-    }));
-
-  if (rows.length === 0) {
-    return NextResponse.json({ date: yyyymmdd, graded: 0 });
-  }
-
-  const admin = createClient(url, serviceKey, {
-    auth: { persistSession: false },
+  // Flatten in league order, re-numbering importance within each league.
+  const games: Game[] = [];
+  results.forEach((leagueGames) => {
+    leagueGames.forEach((g, i) => games.push({ ...g, displayImportance: i + 1 }));
   });
 
-  const { error } = await admin
-    .from("results")
-    .upsert(rows, { onConflict: "slate_date,game_id" });
+  const isoDate = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}T12:00:00`;
 
-  if (error) {
-    return NextResponse.json(
-      { date: yyyymmdd, error: error.message },
-      { status: 500 }
-    );
-  }
-
-  return NextResponse.json({ date: yyyymmdd, graded: rows.length });
+  return NextResponse.json(
+    { date: isoDate, count: games.length, source: "espn", games },
+    { headers: { "Cache-Control": "s-maxage=60, stale-while-revalidate=120" } }
+  );
 }
+
