@@ -147,3 +147,16 @@ export function easternYyyymmdd(d = new Date()): string {
   }).format(d); // en-CA -> "YYYY-MM-DD"
   return parts.replace(/-/g, "");
 }
+
+/** YYYYMMDD for N days ago, US Eastern. */
+export function easternYyyymmddDaysAgo(daysAgo: number): string {
+  return easternYyyymmdd(new Date(Date.now() - daysAgo * 86400000));
+}
+
+/**
+ * The slate_date string used as the key in the picks/results tables.
+ * Must match what /api/slate returns as `date` (ISO noon, no timezone).
+ */
+export function slateKeyFromYyyymmdd(yyyymmdd: string): string {
+  return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}T12:00:00`;
+}
