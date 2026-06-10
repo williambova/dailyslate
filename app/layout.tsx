@@ -12,9 +12,24 @@ import { AppShell } from "@/components/AppShell";
  */
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://dailyslate.io"),
   title: "Daily Slate — Pick winners. Beat your friends.",
   description:
     "A daily sports pick'em game. Make your picks, lock your card, share it, and beat your friends.",
+  openGraph: {
+    title: "Daily Slate",
+    description:
+      "The daily sports pick'em. Pick winners. Beat your friends.",
+    url: "https://dailyslate.io",
+    siteName: "Daily Slate",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Daily Slate",
+    description:
+      "The daily sports pick'em. Pick winners. Beat your friends.",
+  },
 };
 
 export const viewport: Viewport = {
