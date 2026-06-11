@@ -54,6 +54,29 @@ export default function HomePage() {
         <Feature icon={Share2} label="Share the graphic" />
         <Feature icon={Trophy} label="Climb the board" />
       </div>
+
+      {/* Promo showcase — swipeable on mobile, 3-up on desktop */}
+      <div className="mx-auto mt-12 w-full max-w-[1080px] pb-12 lg:mt-16">
+        <h2 className="mb-4 text-center text-xs font-extrabold uppercase tracking-[0.2em] text-ink-600 lg:mb-6">
+          See it in action
+        </h2>
+        <div className="no-scrollbar -mx-6 flex snap-x snap-mandatory gap-4 overflow-x-auto px-6 lg:mx-0 lg:grid lg:grid-cols-3 lg:gap-5 lg:overflow-visible lg:px-0">
+          {[
+            { src: "/promo-share.webp", alt: "Share your card to the group chat" },
+            { src: "/promo-board.webp", alt: "Climb the leaderboard" },
+            { src: "/promo-groups.webp", alt: "Compete with your crew" },
+          ].map((p) => (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              key={p.src}
+              src={p.src}
+              alt={p.alt}
+              loading="lazy"
+              className="w-[80%] max-w-[340px] shrink-0 snap-center rounded-3xl border border-line lg:w-full lg:max-w-none"
+            />
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -74,3 +97,4 @@ function Feature({
     </div>
   );
 }
+
