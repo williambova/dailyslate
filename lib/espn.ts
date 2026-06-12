@@ -12,11 +12,12 @@ import type { Game, GameStatus, League } from "@/types";
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
 
-// Our League -> ESPN {sport, path}. Leagues whose payloads aren't simple
-// two-team matchups (UFC fight cards, GOLF leaderboards) are intentionally
-// omitted — they don't fit a head-to-head pick'em.
+// Our League -> ESPN {sport, path}. GOLF is omitted (leaderboard format,
+// not head-to-head). UFC is included: each fight on a card maps to a game
+// via mapFight below.
 export const ESPN_ENDPOINTS: Partial<Record<League, { sport: string; path: string }>> = {
   WC: { sport: "soccer", path: "fifa.world" },
+  UFC: { sport: "mma", path: "ufc" },
   NBA: { sport: "basketball", path: "nba" },
   WNBA: { sport: "basketball", path: "wnba" },
   NFL: { sport: "football", path: "nfl" },
@@ -103,6 +104,54 @@ export function mapEvent(event: any, league: League, importance: number): Game |
   };
 }
 
+function athleteName(c: any): string {
+  return (
+    c?.athlete?.shortName ||
+    c?.athlete?.displayName ||
+    c?.team?.shortDisplayName ||
+    "TBD"
+  );
+}
+
+/**
+ * Map a single UFC fight (one competition on a card) to a Game. MMA payloads
+ * nest many fights per event and use `athlete` instead of `team`.
+ */
+function mapFight(event: any, comp: any, importance: number): Game | null {
+  const competitors: any[] = comp?.competitors ?? [];
+  if (competitors.length !== 2) return null;
+
+  const a = competitors[0];
+  const b = competitors[1];
+  const nameA = athleteName(a);
+  const nameB = athleteName(b);
+  if (nameA === "TBD" && nameB === "TBD") return null;
+
+  const status = mapStatus(comp?.status?.type?.state ?? event?.status?.type?.state);
+
+  let winner: string | null = null;
+  if (status === "final") {
+    if (a?.winner === true) winner = nameA;
+    else if (b?.winner === true) winner = nameB;
+  }
+
+  return {
+    id: `espn-${comp?.id ?? event.id}`,
+    sport: "mma",
+    league: "UFC",
+    awayTeam: nameA,
+    homeTeam: nameB,
+    startTime: comp?.date || event?.date,
+    status,
+    winner,
+    favoriteTeam: nameA, // display-only; MMA odds payloads are inconsistent
+    underdogTeam: nameB,
+    displayImportance: importance,
+    homeScore: null,
+    awayScore: null,
+  };
+}
+
 /**
  * Fetch one league's scoreboard for a given YYYYMMDD and normalize it.
  * `maxGames` caps noisy slates (e.g. college). Failures resolve to [].
@@ -126,6 +175,20 @@ export async function fetchLeague(
     const data = await res.json();
     const events: any[] = data?.events ?? [];
     const games: Game[] = [];
+
+    if (league === "UFC") {
+      // Each event is a fight card; each competition is a fight. Keep ESPN's
+      // order (main event first) instead of sorting by time, so capping
+      // trims prelims rather than the main card.
+      events.forEach((ev) => {
+        (ev?.competitions ?? []).forEach((comp: any) => {
+          const g = mapFight(ev, comp, games.length + 1);
+          if (g) games.push(g);
+        });
+      });
+      return games.slice(0, maxGames);
+    }
+
     events.forEach((ev, i) => {
       const g = mapEvent(ev, league, i + 1);
       if (g) games.push(g);
